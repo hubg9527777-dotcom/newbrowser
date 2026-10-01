@@ -447,6 +447,43 @@ class ScannerCoreTests(unittest.TestCase):
         self.assertTrue(any(hit[2] == "浏览器书签" for hit in hits))
         self.assertFalse(ScannerCore.scan_is_complete())
 
+    def test_safari_oversized_bookmark_file_is_skipped_as_partial(self):
+        profile_dir = self.root / "Safari"
+        profile_dir.mkdir()
+        (profile_dir / "Bookmarks.plist").write_bytes(b"oversized")
+        profile = {"b": "Safari", "p": "MainSystem", "path": str(profile_dir), "type": "S", "source": "测试"}
+        original_limit = MODULE.MAX_BOOKMARK_FILE_BYTES
+        try:
+            MODULE.MAX_BOOKMARK_FILE_BYTES = 1
+            ScannerCore._reset_diagnostics()
+            hits = ScannerCore.scan(profile, {"example.test": "命中"}, self.root)
+        finally:
+            MODULE.MAX_BOOKMARK_FILE_BYTES = original_limit
+        self.assertEqual(hits, [])
+        self.assertFalse(ScannerCore.scan_is_complete())
+        self.assertIn("Safari 书签解析失败", ScannerCore.diagnostics_text())
+
+    def test_chromium_bookmark_node_limit_marks_scan_partial(self):
+        profile_dir = self.root / "Chrome" / "Default"
+        profile_dir.mkdir(parents=True)
+        (profile_dir / "Bookmarks").write_text(
+            json.dumps({"roots": {"bookmark_bar": {"children": [
+                {"type": "url", "url": "https://example.test/"}
+            ]}}}),
+            encoding="utf-8",
+        )
+        profile = {"b": "Chrome", "p": "Default", "path": str(profile_dir), "type": "C", "source": "测试"}
+        original_limit = MODULE.MAX_BOOKMARK_NODES
+        try:
+            MODULE.MAX_BOOKMARK_NODES = 1
+            ScannerCore._reset_diagnostics()
+            hits = ScannerCore.scan(profile, {"example.test": "命中"}, self.root)
+        finally:
+            MODULE.MAX_BOOKMARK_NODES = original_limit
+        self.assertEqual(hits, [])
+        self.assertFalse(ScannerCore.scan_is_complete())
+        self.assertIn("书签结构超过 1 个节点", ScannerCore.diagnostics_text())
+
     def test_invalid_database_is_isolated_from_following_profile(self):
         invalid_profile = self.root / "Invalid"
         invalid_profile.mkdir()

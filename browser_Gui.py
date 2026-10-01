@@ -36,6 +36,7 @@ DIRECT_READ_BUDGET_SECONDS = 8.0
 SNAPSHOT_BUDGET_SECONDS = 8.0
 MAX_URL_ROWS_PER_TABLE = 100_000
 MAX_BOOKMARK_FILE_BYTES = 64 * 1024 * 1024
+MAX_BOOKMARK_NODES = 250_000
 BOOKMARK_READ_ATTEMPTS = 3
 BOOKMARK_FLUSH_GRACE_SECONDS = 3.0
 
@@ -610,52 +611,52 @@ class ScannerCore:
             if depth > 3 or time.monotonic() >= deadline:
                 return
             try:
-                with os.scandir(current) as iterator:
-                    entries = list(iterator)
+                iterator = os.scandir(current)
             except (OSError, PermissionError):
                 return
-            for entry in entries:
-                if time.monotonic() >= deadline:
-                    return
-                try:
-                    if not entry.is_dir(follow_symlinks=False):
+            with iterator:
+                for entry in iterator:
+                    if time.monotonic() >= deadline:
+                        return
+                    try:
+                        if not entry.is_dir(follow_symlinks=False):
+                            continue
+                    except OSError:
                         continue
-                except OSError:
-                    continue
-                if entry.name.lower() in cls._SKIP_DIRS or entry.name.startswith("$"):
-                    continue
-                path = Path(entry.path)
-                try:
-                    if (path / "places.sqlite").is_file():
-                        path_key = cls._normalise_path_key(path)
-                        if path_key not in seen_paths:
-                            seen_paths.add(path_key)
-                            profiles.append(
-                                {"b": "Firefox(外置)", "p": path.name, "path": str(path), "type": "F", "source": "便携目录"}
+                    if entry.name.lower() in cls._SKIP_DIRS or entry.name.startswith("$"):
+                        continue
+                    path = Path(entry.path)
+                    try:
+                        if (path / "places.sqlite").is_file():
+                            path_key = cls._normalise_path_key(path)
+                            if path_key not in seen_paths:
+                                seen_paths.add(path_key)
+                                profiles.append(
+                                    {"b": "Firefox(外置)", "p": path.name, "path": str(path), "type": "F", "source": "便携目录"}
+                                )
+                            continue
+                        if cls._is_chromium_profile_dir(path):
+                            path_key = cls._normalise_path_key(path)
+                            if path_key not in seen_paths:
+                                seen_paths.add(path_key)
+                                profiles.append(
+                                    {
+                                        "b": cls._infer_browser_name(path.parent),
+                                        "p": path.name,
+                                        "path": str(path),
+                                        "type": "C",
+                                        "source": "便携目录",
+                                    }
+                                )
+                            continue
+                        if cls._is_valid_user_data(path):
+                            profiles.extend(
+                                cls._collect_chrome_profiles(path, cls._infer_browser_name(path), seen_paths, "便携目录")
                             )
+                            continue
+                    except (OSError, PermissionError):
                         continue
-                    if cls._is_chromium_profile_dir(path):
-                        path_key = cls._normalise_path_key(path)
-                        if path_key not in seen_paths:
-                            seen_paths.add(path_key)
-                            profiles.append(
-                                {
-                                    "b": cls._infer_browser_name(path.parent),
-                                    "p": path.name,
-                                    "path": str(path),
-                                    "type": "C",
-                                    "source": "便携目录",
-                                }
-                            )
-                        continue
-                    if cls._is_valid_user_data(path):
-                        profiles.extend(
-                            cls._collect_chrome_profiles(path, cls._infer_browser_name(path), seen_paths, "便携目录")
-                        )
-                        continue
-                except (OSError, PermissionError):
-                    continue
-                visit(path, depth + 1)
+                    visit(path, depth + 1)
 
         drives = cls._get_windows_drives()
         for drive in drives:
@@ -1082,11 +1083,56 @@ class ScannerCore:
         raise ValueError("bookmark file could not be read")
 
     @classmethod
+    def _scan_bookmark_tree(
+        cls,
+        root: object,
+        url_key: str,
+        info_type: str,
+        profile: Dict[str, str],
+        rules: Dict[str, str],
+        hits: List[Tuple],
+        deadline: Optional[float] = None,
+    ) -> int:
+        """Traverse bookmark data with bounded work and without stacking every sibling."""
+        pending = [iter((root,))]
+        visited = 0
+        url_count = 0
+        while pending:
+            cls._remaining_seconds(deadline, default=PROFILE_SCAN_BUDGET_SECONDS)
+            try:
+                node = next(pending[-1])
+            except StopIteration:
+                pending.pop()
+                continue
+
+            visited += 1
+            if visited > MAX_BOOKMARK_NODES:
+                profile_label = cls._diagnostic_profile_label(profile)
+                cls._mark_partial(f"{profile_label} 的书签节点达到读取限额")
+                cls._record(
+                    "warning",
+                    "书签限额",
+                    f"{profile_label} 的书签结构超过 {MAX_BOOKMARK_NODES} 个节点，超出部分已跳过。",
+                )
+                break
+
+            if isinstance(node, dict):
+                value = node.get(url_key)
+                if isinstance(value, str):
+                    url_count += 1
+                    cls._match(value, info_type, profile, rules, hits)
+                pending.append(iter(child for key, child in node.items() if key != url_key))
+            elif isinstance(node, list):
+                pending.append(iter(node))
+        return url_count
+
+    @classmethod
     def _scan_chromium_bookmarks(
         cls,
         profile: Dict[str, str],
         rules: Dict[str, str],
         hits: List[Tuple],
+        deadline: Optional[float] = None,
     ) -> None:
         profile_path = Path(profile["path"])
 
@@ -1111,20 +1157,9 @@ class ScannerCore:
             hit_start = len(hits)
             try:
                 data = cls._load_stable_bookmark_json(bookmark_path)
-                pending: List[object] = [data]
-                url_count = 0
-                while pending:
-                    node = pending.pop()
-                    if isinstance(node, dict):
-                        value = node.get("url")
-                        if isinstance(value, str):
-                            url_count += 1
-                            cls._match(value, info_type, profile, rules, hits)
-                        pending.extend(
-                            child for key, child in node.items() if key != "url"
-                        )
-                    elif isinstance(node, list):
-                        pending.extend(node)
+                url_count = cls._scan_bookmark_tree(
+                    data, "url", info_type, profile, rules, hits, deadline
+                )
 
                 match_count = len(hits) - hit_start
                 if bookmark_name != "Bookmarks" or match_count:
@@ -1133,7 +1168,7 @@ class ScannerCore:
                         "书签",
                         f"{cls._diagnostic_profile_label(profile)} 的 {bookmark_name} 已读取 {url_count} 个网址，命中 {match_count} 条。",
                     )
-            except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            except (OSError, ValueError, TypeError, RecursionError, json.JSONDecodeError) as exc:
                 cls._mark_partial(
                     f"{cls._diagnostic_profile_label(profile)} 的 {bookmark_name} 解析失败"
                 )
@@ -1154,7 +1189,7 @@ class ScannerCore:
     ) -> None:
         profile_path = Path(profile["path"])
         # 书签与 History 完全解耦并优先读取，History 故障不能阻断任何书签存储。
-        cls._scan_chromium_bookmarks(profile, rules, hits)
+        cls._scan_chromium_bookmarks(profile, rules, hits, deadline)
 
         history_path = profile_path / "History"
         if not history_path.is_file():
@@ -1262,19 +1297,20 @@ class ScannerCore:
         if plist_path.is_file():
             try:
                 with plist_path.open("rb") as file_handler:
-                    plist_data = plistlib.load(file_handler)
-
-                pending: List[object] = [plist_data]
-                while pending:
-                    node = pending.pop()
-                    if isinstance(node, dict):
-                        value = node.get("URLString")
-                        if isinstance(value, str):
-                            cls._match(value, "浏览器书签", profile, rules, hits)
-                        pending.extend(node.values())
-                    elif isinstance(node, list):
-                        pending.extend(node)
-            except (OSError, ValueError, TypeError) as exc:
+                    payload = file_handler.read(MAX_BOOKMARK_FILE_BYTES + 1)
+                if len(payload) > MAX_BOOKMARK_FILE_BYTES:
+                    raise ValueError("bookmark file exceeds safety limit")
+                plist_data = plistlib.loads(payload)
+                cls._scan_bookmark_tree(
+                    plist_data,
+                    "URLString",
+                    "浏览器书签",
+                    profile,
+                    rules,
+                    hits,
+                    deadline,
+                )
+            except (OSError, ValueError, TypeError, RecursionError) as exc:
                 cls._mark_partial("Safari Bookmarks.plist 解析失败")
                 cls._record("warning", "书签", f"Safari 书签解析失败：{cls._safe_error_summary(exc)}")
 
